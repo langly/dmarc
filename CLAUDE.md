@@ -16,6 +16,8 @@ python3 dmarc_report.py some.zip other.xml # specific files
 python3 dmarc_report.py --no-html          # terminal summary only
 python3 dmarc_report.py --json agg.json    # also dump the aggregate dict
 python3 dmarc_report.py --rdns             # reverse-DNS sending IPs (network calls)
+python3 dmarc_report.py --spf              # classify sources as yours/other from live SPF (runs `dig`)
+python3 dmarc_report.py --mine 203.0.113.10 # same split, hosts given by hand (repeatable, CIDR ok)
 ```
 
 To check a change, run the script against this folder and compare the terminal summary / open the HTML.
@@ -28,6 +30,7 @@ A single pipeline in `main()`: `collect` → `aggregate` → (`resolve_rdns`) �
 - **Dedup**: reports are deduplicated on `(org.lower(), report_id)`, so the same report arriving as both `.xml` and `.zip` is counted once.
 - **Pass/fail semantics**: `Record.aligned_pass` uses the receiver's `policy_evaluated` dkim/spf results (which already mean pass-and-aligned). "Aligned" counters use those; the `*_raw` counters use the unaligned `auth_results`.
 - **Aggregation**: `aggregate` returns one plain dict (with `defaultdict`s and `set`s) keyed by totals, `by_day`, `by_source` (per IP), `by_org`, `by_domain`, `policies` (most recent published policy per domain), `reasons`. The terminal, HTML, and JSON outputs all read from this dict, so a new metric goes there first. The JSON writer converts sets and defaultdicts itself.
+- **Yours vs other**: `classify_sources` sets `mine` on each `by_source` entry and fills `fail_mine`/`fail_other`, but only when `--spf`/`--mine` is given (`agg["classified"]`). `spf_networks` follows include/redirect and resolves a/mx through `dig`, because stdlib has no TXT lookup. Per-source `fail_details` counts *only failing* records, so passing records' auth results don't muddy the diagnosis.
 - **HTML**: built from f-strings with inline `CSS`/`JS` constants. There are no external assets, so the file stays self-contained. Everything interpolated from reports must go through `esc()`. Tooltips are HTML stored in `data-tt` attributes and shown by the small JS block. The CSS uses color tokens on `:root` with dark-mode overrides for both `prefers-color-scheme` and `[data-theme]`, so new colors need all three definitions.
 
 ## Gotcha

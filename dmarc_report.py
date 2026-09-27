@@ -8,6 +8,8 @@ summary plus a self-contained HTML dashboard.
     ./dmarc_report.py                    # scan ., write dmarc-summary.html
     ./dmarc_report.py reports/ -o d.html # scan a directory, choose the output
     ./dmarc_report.py --rdns             # also reverse-resolve sending IPs
+    ./dmarc_report.py --spf              # mark sources your SPF authorizes as yours
+    ./dmarc_report.py --mine 192.0.2.0/24  # ...or list your hosts yourself
     ./dmarc_report.py --no-html          # terminal summary only
 """
 
@@ -17,9 +19,12 @@ import argparse
 import gzip
 import html
 import io
+import ipaddress
 import json
 import os
+import re
 import socket
+import subprocess
 import sys
 import zipfile
 from collections import defaultdict
@@ -224,12 +229,16 @@ def aggregate(reports):
         "spf_raw": 0,
         "dkim_raw": 0,
         "dispositions": defaultdict(int),
-        "by_day": defaultdict(lambda: {"pass": 0, "fail": 0}),
+        "by_day": defaultdict(lambda: {"pass": 0, "fail": 0, "fail_ips": defaultdict(int)}),
         "by_source": {},
         "by_org": defaultdict(lambda: {"messages": 0, "reports": 0}),
         "by_domain": defaultdict(lambda: {"messages": 0, "pass": 0, "fail": 0}),
         "policies": {},
         "reasons": defaultdict(int),
+        "classified": False,  # set by classify_sources
+        "authorized": [],
+        "fail_mine": 0,
+        "fail_other": 0,
         "begin": None,
         "end": None,
     }
@@ -256,6 +265,8 @@ def aggregate(reports):
             agg["messages"] += n
             agg["pass" if ok else "fail"] += n
             agg["by_day"][day]["pass" if ok else "fail"] += n
+            if not ok:
+                agg["by_day"][day]["fail_ips"][rec.source_ip] += n
             agg["dispositions"][rec.disposition] += n
             if rec.pol_spf == "pass":
                 agg["spf_aligned"] += n
@@ -287,6 +298,8 @@ def aggregate(reports):
                     "spf_domains": set(),
                     "orgs": set(),
                     "rdns": "",
+                    "mine": None,
+                    "fail_details": defaultdict(int),
                 },
             )
             src["messages"] += n
@@ -303,8 +316,122 @@ def aggregate(reports):
             for dom, res, _s in rec.spf:
                 src["spf_domains"].add(f"{dom} {res}")
             src["orgs"].add(rep.org)
+            if not ok:
+                src["fail_details"][fail_detail(rec)] += n
 
     return agg
+
+
+def fail_detail(rec):
+    """One line describing why a failing record failed, for grouping."""
+    dkim = ", ".join(f"{d}{'/' + s if s else ''} {r}" for d, r, s in rec.dkim) or "unsigned"
+    spf = ", ".join(f"{d} {r}{' (' + sc + ')' if sc else ''}" for d, r, sc in rec.spf) or "none"
+    return (
+        f"from {rec.header_from or '?'}, envelope {rec.envelope_from or '-'}"
+        f" | dkim: {dkim} | spf: {spf}"
+    )
+
+
+# --------------------------------------------------------------------------
+# Which sources are yours
+# --------------------------------------------------------------------------
+
+
+def _dig(name, rtype):
+    try:
+        out = subprocess.run(
+            ["dig", "+short", rtype, name], capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  ! dig {rtype} {name} failed: {exc}", file=sys.stderr)
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _host_networks(host, prefix4=32, prefix6=128):
+    nets = []
+    for rtype, plen in (("A", prefix4), ("AAAA", prefix6)):
+        for ans in _dig(host, rtype):
+            try:  # skip CNAME lines
+                nets.append(ipaddress.ip_network(f"{ans}/{plen}", strict=False))
+            except ValueError:
+                pass
+    return nets
+
+
+def spf_networks(domain, _depth=0, _seen=None):
+    """Networks a domain's SPF record authorizes with a pass ('+') qualifier.
+
+    Follows include:/redirect= and resolves a/mx mechanisms. exists:/ptr and
+    macros are ignored, which is fine for listing your own senders.
+    """
+    seen = set() if _seen is None else _seen
+    if _depth > 10 or domain.lower() in seen:
+        return []
+    seen.add(domain.lower())
+    txts = ["".join(re.findall(r'"((?:[^"\\]|\\.)*)"', t)) or t for t in _dig(domain, "TXT")]
+    records = [t for t in txts if t.lower().split()[:1] == ["v=spf1"]]
+    if not records:
+        print(f"  ! no SPF record for {domain}", file=sys.stderr)
+        return []
+
+    nets = []
+    for term in records[0].split()[1:]:
+        if term.lower().startswith("redirect="):
+            nets += spf_networks(term.split("=", 1)[1], _depth + 1, seen)
+            continue
+        qual = "+"
+        if term[:1] in "+-~?":
+            qual, term = term[0], term[1:]
+        if qual != "+":
+            continue
+        mech, _, arg = term.partition(":")
+        mech = mech.lower()
+        # a/24 and mx//64 style prefixes may sit on the mechanism or the argument
+        if "/" in mech:
+            mech, _, cidr = mech.partition("/")
+        else:
+            arg, _, cidr = arg.partition("/")
+        p4, _, p6 = cidr.partition("/")
+        try:
+            p4, p6 = int(p4 or 32), int(p6 or 128)
+            if mech in ("ip4", "ip6"):
+                nets.append(ipaddress.ip_network(term.split(":", 1)[1], strict=False))
+            elif mech == "a":
+                nets += _host_networks(arg or domain, p4, p6)
+            elif mech == "mx":
+                for ans in _dig(arg or domain, "MX"):
+                    nets += _host_networks(ans.split()[-1].rstrip("."), p4, p6)
+            elif mech == "include":
+                nets += spf_networks(arg, _depth + 1, seen)
+        except ValueError:
+            print(f"  ! {domain}: cannot parse SPF term {term!r}", file=sys.stderr)
+    return nets
+
+
+def parse_networks(values):
+    nets = []
+    for v in values:
+        try:
+            nets.append(ipaddress.ip_network(v, strict=False))
+        except ValueError:
+            print(f"  ! --mine: not an IP or CIDR: {v}", file=sys.stderr)
+    return nets
+
+
+def classify_sources(agg, networks):
+    """Mark each source as yours (inside `networks`) or another sender's."""
+    agg["classified"] = True
+    agg["authorized"] = sorted({str(n) for n in networks})
+    for src in agg["by_source"].values():
+        try:
+            ip = ipaddress.ip_address(src["ip"])
+        except ValueError:
+            ip = None
+        src["mine"] = ip is not None and any(ip in n for n in networks)
+        agg["fail_mine" if src["mine"] else "fail_other"] += src["fail"]
+    for v in agg["by_day"].values():
+        v["fail_mine"] = sum(n for ip, n in v["fail_ips"].items() if agg["by_source"][ip]["mine"])
 
 
 def resolve_rdns(agg, timeout=1.5):
@@ -364,12 +491,18 @@ def print_summary(reports, agg, dupes):
     print()
     print("Sending sources")
     print(line)
+    cls = agg["classified"]
+    if cls:
+        print(f"  Your hosts: {', '.join(agg['authorized']) or 'none found'}")
     hdr = f"  {'source ip':<20} {'msgs':>6} {'dmarc':>7} {'spf':>6} {'dkim':>6}  header-from"
+    if cls:
+        hdr = f"  {'':<5} {hdr.lstrip()}"
     print(hdr)
     for src in sorted(agg["by_source"].values(), key=lambda s: -s["messages"]):
         n = src["messages"]
+        who = (f"{'yours' if src['mine'] else 'other':<5} " if cls else "")
         print(
-            f"  {src['ip']:<20} {n:>6} "
+            f"  {who}{src['ip']:<20} {n:>6} "
             f"{pct(src['pass'], n):>6.0f}% "
             f"{pct(src['spf_aligned'], n):>5.0f}% "
             f"{pct(src['dkim_aligned'], n):>5.0f}%  "
@@ -377,22 +510,28 @@ def print_summary(reports, agg, dupes):
             + (f"  [{src['rdns']}]" if src["rdns"] else "")
         )
 
-    fails = [s for s in agg["by_source"].values() if s["fail"]]
-    if fails:
+    fails = sorted((s for s in agg["by_source"].values() if s["fail"]), key=lambda s: -s["fail"])
+    if cls:
+        groups = [
+            ("Your hosts failing DMARC: fix your signing/SPF", [s for s in fails if s["mine"]]),
+            ("Other senders failing DMARC: spoofing or forwarding", [s for s in fails if not s["mine"]]),
+        ]
+    else:
+        groups = [("Needs attention (messages failing DMARC)", fails)]
+    for title, group in groups:
+        if not group:
+            continue
         print()
-        print("Needs attention (messages failing DMARC)")
+        print(f"{title}  ({sum(s['fail'] for s in group)} msgs)")
         print(line)
-        for src in sorted(fails, key=lambda s: -s["fail"]):
-            why = []
-            if src["spf_aligned"] < src["messages"]:
-                why.append("SPF not aligned/passing")
-            if src["dkim_aligned"] < src["messages"]:
-                why.append("DKIM not aligned/passing")
-            print(f"  {src['ip']:<20} {src['fail']:>6} failing   {'; '.join(why)}")
-            for d in sorted(src["dkim_domains"]):
-                print(f"      dkim: {d}")
-            for d in sorted(src["spf_domains"]):
-                print(f"      spf:  {d}")
+        for src in group:
+            print(f"  {src['ip']:<20} {src['fail']:>6} failing"
+                  + (f"  [{src['rdns']}]" if src["rdns"] else ""))
+            for d, cnt in sorted(src["fail_details"].items(), key=lambda kv: -kv[1]):
+                print(f"      {cnt:>4} x  {d}")
+    if cls and not fails:
+        print()
+        print("No messages failing DMARC.")
     print()
 
 
@@ -409,6 +548,7 @@ CSS = """
   --series-1:#2a78d6;
   --good:#0ca30c; --warning:#fab219; --serious:#ec835a; --critical:#d03b3b;
   --good-wash:rgba(12,163,12,.10); --crit-wash:rgba(208,59,59,.10);
+  --series-wash:rgba(42,120,214,.10);
   --wash:rgba(11,11,11,.04);
 }
 @media (prefers-color-scheme: dark){
@@ -419,6 +559,7 @@ CSS = """
     --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
     --series-1:#3987e5;
     --good-wash:rgba(12,163,12,.16); --crit-wash:rgba(208,59,59,.16);
+    --series-wash:rgba(57,135,229,.18);
     --wash:rgba(255,255,255,.05);
   }
 }
@@ -429,6 +570,7 @@ CSS = """
   --grid:#2c2c2a; --axis:#383835; --ring:rgba(255,255,255,.10);
   --series-1:#3987e5;
   --good-wash:rgba(12,163,12,.16); --crit-wash:rgba(208,59,59,.16);
+  --series-wash:rgba(57,135,229,.18);
   --wash:rgba(255,255,255,.05);
 }
 
@@ -467,10 +609,11 @@ h2{font-size:13px; font-weight:600; letter-spacing:.04em; text-transform:upperca
 .col{flex:1 1 0; min-width:14px; max-width:48px; display:flex; flex-direction:column;
      justify-content:flex-end; height:100%; position:relative; cursor:default}
 .col .stack{display:flex; flex-direction:column; justify-content:flex-end; gap:2px; height:100%}
-.seg{border-radius:4px 4px 0 0; min-height:2px}
-.seg.pass{background:var(--series-1); border-radius:0}
-.seg.fail{background:var(--critical); border-radius:4px 4px 0 0}
-.stack > .seg.pass:first-child{border-radius:4px 4px 0 0}
+.seg{border-radius:0; min-height:2px}
+.stack > .seg:first-child{border-radius:4px 4px 0 0}
+.seg.pass{background:var(--series-1)}
+.seg.fail{background:var(--critical)}
+.seg.fail-other{background:var(--serious)}
 .xaxis{display:flex; margin-top:8px; padding-bottom:12px}
 .xaxis div{flex:1 1 0; min-width:14px; max-width:48px; text-align:center;
            font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums;
@@ -500,6 +643,8 @@ th.num,td.num{text-align:right; font-variant-numeric:tabular-nums}
 .chip.ok{background:var(--good-wash); color:var(--good)}
 .chip.bad{background:var(--crit-wash); color:var(--critical)}
 .chip.warn{background:rgba(250,178,25,.16); color:#8a5c00}
+.chip.mine{background:var(--series-wash); color:var(--series-1)}
+.chip.other{background:var(--wash); color:var(--ink-2)}
 :root[data-theme="dark"] .chip.warn{color:var(--warning)}
 @media (prefers-color-scheme:dark){
   :root:not([data-theme="light"]) .chip.warn{color:var(--warning)}
@@ -507,6 +652,9 @@ th.num,td.num{text-align:right; font-variant-numeric:tabular-nums}
 
 .note{font-size:12.5px; color:var(--ink-2); margin:10px 0 0}
 .attn{border-left:2px solid var(--critical); padding-left:14px; margin:10px 0 0}
+.attn.other{border-left-color:var(--axis)}
+.attn-group + .attn-group{margin-top:22px}
+.attn-group h4{font-size:12px; font-weight:600; color:var(--ink-2); margin:0}
 .attn h3{font-size:13px; margin:0 0 4px; font-weight:600}
 .attn ul{margin:4px 0 0; padding-left:18px; color:var(--ink-2); font-size:12.5px}
 footer{margin-top:40px; color:var(--muted); font-size:12px}
@@ -573,6 +721,7 @@ def render_timeline(agg):
     if len(days) < 2:
         return ""
     peak = max(agg["by_day"][d]["pass"] + agg["by_day"][d]["fail"] for d in days) or 1
+    cls = agg["classified"]
     cols, labels = [], []
     for d in days:
         v = agg["by_day"][d]
@@ -580,16 +729,27 @@ def render_timeline(agg):
         hp = 100.0 * v["pass"] / peak
         hf = 100.0 * v["fail"] / peak
         segs = ""
-        if v["fail"]:
-            segs += f'<div class="seg fail" style="height:{hf:.2f}%"></div>'
-        if v["pass"]:
-            segs += f'<div class="seg pass" style="height:{hp:.2f}%"></div>'
         tt = (
             f"<b>{esc(d)}</b>"
             f'<div class="r"><span>Messages</span><span>{tot}</span></div>'
             f'<div class="r"><span>DMARC pass</span><span>{v["pass"]} ({pct(v["pass"], tot):.0f}%)</span></div>'
-            f'<div class="r"><span>DMARC fail</span><span>{v["fail"]} ({pct(v["fail"], tot):.0f}%)</span></div>'
         )
+        if cls:
+            fm, fo = v["fail_mine"], v["fail"] - v["fail_mine"]
+            if fm:
+                segs += f'<div class="seg fail" style="height:{100.0 * fm / peak:.2f}%"></div>'
+            if fo:
+                segs += f'<div class="seg fail-other" style="height:{100.0 * fo / peak:.2f}%"></div>'
+            tt += (
+                f'<div class="r"><span>Fail, your hosts</span><span>{fm} ({pct(fm, tot):.0f}%)</span></div>'
+                f'<div class="r"><span>Fail, other senders</span><span>{fo} ({pct(fo, tot):.0f}%)</span></div>'
+            )
+        else:
+            if v["fail"]:
+                segs += f'<div class="seg fail" style="height:{hf:.2f}%"></div>'
+            tt += f'<div class="r"><span>DMARC fail</span><span>{v["fail"]} ({pct(v["fail"], tot):.0f}%)</span></div>'
+        if v["pass"]:
+            segs += f'<div class="seg pass" style="height:{hp:.2f}%"></div>'
         cols.append(f'<div class="col" tabindex="0" data-tt="{esc(tt)}"><div class="stack">{segs}</div></div>')
         labels.append(d)
 
@@ -605,12 +765,19 @@ def render_timeline(agg):
         for i, d in enumerate(labels)
     ]
     track = f"min-width:{len(days) * (14 + gap)}px; gap:{gap}px"
+    if cls:
+        legend_fail = (
+            '<span><i class="swatch" style="background:var(--critical)"></i>&#10007; Fail from your hosts</span>'
+            '<span><i class="swatch" style="background:var(--serious)"></i>&#10007; Fail from other senders</span>'
+        )
+    else:
+        legend_fail = '<span><i class="swatch" style="background:var(--critical)"></i>&#10007; DMARC fail</span>'
     return f"""
 <h2>Volume over time</h2>
 <div class="card chart">
   <div class="legend">
     <span><i class="swatch" style="background:var(--series-1)"></i>&#10003; DMARC pass</span>
-    <span><i class="swatch" style="background:var(--critical)"></i>&#10007; DMARC fail</span>
+    {legend_fail}
   </div>
   <div class="plotwrap">
     <div class="plot" style="{track}">{grid}{''.join(cols)}</div>
@@ -641,6 +808,9 @@ def render_html(reports, agg, dupes, out_path):
                  meter=pct(agg["dkim_aligned"], total)),
         ]
     )
+    if agg["classified"]:
+        tiles += tile("Failing from your hosts", f"{agg['fail_mine']:,}",
+                      f"{agg['fail_other']:,} failing from other senders")
 
     # policy panel
     prow = "".join(
@@ -672,8 +842,12 @@ def render_html(reports, agg, dupes, out_path):
         dmarc_chip = chip(s["fail"] == 0, f"{pct(s['pass'], n):.0f}% pass")
         spf_chip = chip(s["spf_aligned"] == n, f"{pct(s['spf_aligned'], n):.0f}%")
         dkim_chip = chip(s["dkim_aligned"] == n, f"{pct(s['dkim_aligned'], n):.0f}%")
+        who = ""
+        if agg["classified"]:
+            who = ('<td><span class="chip mine">yours</span></td>' if s["mine"]
+                   else '<td><span class="chip other">other</span></td>')
         srows.append(
-            f'<tr tabindex="0" data-tt="{esc(tt)}">'
+            f'<tr tabindex="0" data-tt="{esc(tt)}">{who}'
             f"<td class='mono'>{esc(s['ip'])}"
             + (f"<div class='dim'>{esc(s['rdns'])}</div>" if s["rdns"] else "")
             + "</td>"
@@ -689,22 +863,37 @@ def render_html(reports, agg, dupes, out_path):
     attn = ""
     fails = sorted((s for s in agg["by_source"].values() if s["fail"]), key=lambda s: -s["fail"])
     if fails:
-        blocks = []
-        for s in fails:
-            why = []
-            if s["spf_aligned"] < s["messages"]:
-                why.append("SPF did not pass and align")
-            if s["dkim_aligned"] < s["messages"]:
-                why.append("DKIM did not pass and align")
-            detail = sorted(s["dkim_domains"]) + sorted(s["spf_domains"])
-            blocks.append(
-                f"<div class='attn'><h3>{esc(s['ip'])} &mdash; {s['fail']:,} message"
-                f"{'s' if s['fail'] != 1 else ''} failing DMARC</h3>"
-                f"<div class='dim'>{esc('; '.join(why))}</div>"
-                + ("<ul>" + "".join(f"<li class='mono'>{esc(d)}</li>" for d in detail) + "</ul>" if detail else "")
-                + "</div>"
-            )
-        attn = f"<h2>Needs attention</h2><div class='card'>{''.join(blocks)}</div>"
+        def attn_blocks(group, cls=""):
+            blocks = []
+            for s in group:
+                detail = sorted(s["fail_details"].items(), key=lambda kv: -kv[1])
+                blocks.append(
+                    f"<div class='attn {cls}'><h3>{esc(s['ip'])} &mdash; {s['fail']:,} message"
+                    f"{'s' if s['fail'] != 1 else ''} failing DMARC</h3>"
+                    + (f"<div class='dim'>{esc(s['rdns'])}</div>" if s["rdns"] else "")
+                    + "<ul>"
+                    + "".join(f"<li class='mono'>{c}&times; {esc(d)}</li>" for d, c in detail)
+                    + "</ul></div>"
+                )
+            return "".join(blocks)
+
+        if agg["classified"]:
+            mine = [s for s in fails if s["mine"]]
+            other = [s for s in fails if not s["mine"]]
+            groups = []
+            if mine:
+                groups.append(
+                    "<div class='attn-group'><h4>Your hosts: fix signing or SPF</h4>"
+                    + attn_blocks(mine) + "</div>")
+            if other:
+                groups.append(
+                    "<div class='attn-group'><h4>Other senders: spoofing or forwarding"
+                    " (your policy decides what happens to these)</h4>"
+                    + attn_blocks(other, "other") + "</div>")
+            body = "".join(groups)
+        else:
+            body = attn_blocks(fails)
+        attn = f"<h2>Needs attention</h2><div class='card'>{body}</div>"
 
     # reports
     rrows = "".join(
@@ -744,7 +933,7 @@ def render_html(reports, agg, dupes, out_path):
 <h2>Sending sources</h2>
 <div class="card scroll">
 <table>
-<thead><tr><th>Source IP</th><th class="num">Messages</th><th>DMARC</th>
+<thead><tr>{'<th>Sender</th>' if agg['classified'] else ''}<th>Source IP</th><th class="num">Messages</th><th>DMARC</th>
 <th>SPF aligned</th><th>DKIM aligned</th><th>Header from</th><th>Disposition</th></tr></thead>
 <tbody>{''.join(srows)}</tbody></table>
 </div>
@@ -784,6 +973,10 @@ def main():
     ap.add_argument("--no-html", action="store_true", help="terminal summary only")
     ap.add_argument("--json", metavar="PATH", help="also write the aggregate as JSON")
     ap.add_argument("--rdns", action="store_true", help="reverse-resolve sending IPs")
+    ap.add_argument("--spf", action="store_true",
+                    help="look up your domains' SPF records (via dig) to tell your hosts from others")
+    ap.add_argument("--mine", action="append", default=[], metavar="IP_OR_CIDR",
+                    help="treat this address/network as your own sender (repeatable)")
     ap.add_argument("--no-recursive", action="store_true", help="do not descend into subdirectories")
     args = ap.parse_args()
 
@@ -793,6 +986,12 @@ def main():
         return 1
 
     agg = aggregate(reports)
+    if args.spf or args.mine:
+        networks = parse_networks(args.mine)
+        if args.spf:
+            for dom in sorted(agg["policies"]):
+                networks += spf_networks(dom)
+        classify_sources(agg, networks)
     if args.rdns:
         resolve_rdns(agg)
 
