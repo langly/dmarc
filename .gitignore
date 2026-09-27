@@ -1,0 +1,9 @@
+# DMARC reports and generated output contain real domains and IPs
+*.xml
+*.zip
+*.gz
+*.gzip
+google.com*
+zohomail.com*
+dmarc-summary.html
+*.json
