@@ -588,6 +588,14 @@ h1{font-size:22px; font-weight:600; letter-spacing:-.01em; margin:0 0 6px}
 h2{font-size:13px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
    color:var(--ink-2); margin:36px 0 12px}
 .card{background:var(--surface); border:1px solid var(--ring); border-radius:10px; padding:18px 20px}
+details.fold > summary{list-style:none; cursor:pointer}
+details.fold > summary::-webkit-details-marker{display:none}
+details.fold > summary h2{display:inline-flex; align-items:center; gap:8px}
+details.fold > summary h2::after{content:""; width:6px; height:6px; margin-top:-3px;
+   border:solid currentColor; border-width:0 2px 2px 0; transform:rotate(45deg); transition:transform .15s}
+details.fold[open] > summary h2::after{transform:rotate(-135deg); margin-top:3px}
+details.fold > summary:hover h2{color:var(--ink)}
+details.fold > summary .count{font-weight:400; text-transform:none; letter-spacing:0}
 
 /* stat tiles */
 .tiles{display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:12px}
@@ -946,13 +954,15 @@ def render_html(reports, agg, dupes, out_path):
 <p class="note">Dispositions applied by receivers: {disp_line}</p>
 </div>
 
-<h2>Reports ingested</h2>
+<details class="fold">
+<summary><h2>Reports ingested <span class="count">({len(reports)})</span></h2></summary>
 <div class="card scroll">
 <table>
 <thead><tr><th>Reporter</th><th>Report ID</th><th>Window</th>
 <th class="num">Records</th><th class="num">Messages</th><th>File</th></tr></thead>
 <tbody>{rrows}</tbody></table>
 </div>
+</details>
 
 <footer>Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} by dmarc_report.py.
 &ldquo;Aligned&rdquo; means the identifier passed authentication <em>and</em> matched the
